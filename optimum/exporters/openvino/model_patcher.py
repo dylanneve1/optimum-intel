@@ -4923,6 +4923,101 @@ class SanaTextEncoderModelPatcher(ModelPatcher):
             ALL_MASK_ATTENTION_FUNCTIONS.register("sdpa", sdpa_mask)
 
 
+def minicpm_attn_forward(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_value=None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
+    **kwargs,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    # SDPA forward adapted from openbmb/MiniCPM4.1-8B modeling_minicpm.py. The
+    # upstream code derives kv_seq_len from position_ids.max() + 1, which only
+    # covers the current query window. During the stateful (with-past) OpenVINO
+    # export the keys span past + query after past_key_value.update, so the
+    # attention-mask size check fails (mask kv-dim != kv_seq_len) and tracing
+    # raises "The size of tensor a (N) must match tensor b (M)". Derive
+    # kv_seq_len from the cache length instead, as transformers' own SDPA paths
+    # and the MiniCPM3 patcher do.
+    def rotate_half(x):
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
+        orig_dtype = k.dtype
+        cos = cos[position_ids].unsqueeze(unsqueeze_dim)
+        sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+        q_fp32 = q.to(dtype=torch.float32, device=q.device)
+        k_fp32 = k.to(dtype=torch.float32, device=k.device)
+        q_embed = (q_fp32 * cos) + (rotate_half(q_fp32) * sin)
+        k_embed = (k_fp32 * cos) + (rotate_half(k_fp32) * sin)
+        return q_embed.to(dtype=orig_dtype), k_embed.to(dtype=orig_dtype)
+
+    def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+        batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+        if n_rep == 1:
+            return hidden_states
+        hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+        return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+    if output_attentions:
+        return self._orig_forward(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+        )
+
+    bsz, q_len, _ = hidden_states.size()
+
+    query_states = self.q_proj(hidden_states)
+    key_states = self.k_proj(hidden_states)
+    value_states = self.v_proj(hidden_states)
+
+    query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+    key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+    value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+    kv_seq_len = key_states.shape[-2]
+    if past_key_value is not None:
+        kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+    cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+    if past_key_value is not None:
+        cache_kwargs = {"sin": sin, "cos": cos}
+        key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+    key_states = repeat_kv(key_states, self.num_key_value_groups)
+    value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+    if attention_mask is not None and attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+        raise ValueError(
+            f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+        )
+
+    attn_output = torch.nn.functional.scaled_dot_product_attention(
+        query_states,
+        key_states,
+        value_states,
+        attn_mask=attention_mask,
+        dropout_p=self.attention_dropout if self.training else 0.0,
+        is_causal=self.is_causal and attention_mask is None and q_len > 1,
+    )
+
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+    attn_output = self.o_proj(attn_output)
+
+    return attn_output, None, past_key_value
+
+
 class MiniCPMModelPatcher(OVDecoderModelPatcher):
     def __init__(
         self,
@@ -4936,6 +5031,17 @@ class MiniCPMModelPatcher(OVDecoderModelPatcher):
                 layer.mlp.down_proj.to(torch.float32)
 
         super().__init__(config, model, model_kwargs)
+
+    def __enter__(self):
+        super().__enter__()
+        for block in self._model.model.layers:
+            block.self_attn._orig_forward = block.self_attn.forward
+            block.self_attn.forward = types.MethodType(minicpm_attn_forward, block.self_attn)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+        for block in self._model.model.layers:
+            block.self_attn.forward = block.self_attn._orig_forward
 
 
 class CommonImageEmbeddingsModelPatcher(ModelPatcher):
